@@ -1,0 +1,666 @@
+---
+title: "Assignment 2 Code"
+author: "Henry Kanengiser"
+date: '2022-11-07'
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+The **purpose** of this file is to conduct the analyses used in Henry
+Kanengiser's Medium post [title here](link%20here)
+
+```{r read in data}
+#Libraries
+library(tidyverse)
+library(lubridate)
+library(tidycensus)
+library(janitor)
+library(data.table)
+library(gt)
+library(sf)
+
+
+#Datasets
+
+```
+
+# 1. Read in crashes data
+
+Data on crashes in NYC come from
+[crashmapper](http://crashmapper.org/#/). The website documents the
+date, time, and location of every crash repored by the NYPD. It also
+includes information on serious injuries and deaths by mode of transit
+(motorist, cyclist, pedestrian). The data I use in this project was
+downloaded on November 2, 2022.
+
+```{r}
+crashes <- read_csv("crashmapper.csv")
+```
+
+I am particularly interested in the bicycle data and subset the data
+accordingly.
+
+```{r}
+glimpse(crashes)
+
+# time range
+min(crashes$date_time)
+max(crashes$date_time)
+
+# August 2011 -> October 2022
+# This means that 2011 data shouldn't be treated like a full year and we should instead start in 2012
+
+crashes_cleaned <- crashes %>%
+  select(-c(the_geom, cartodb_id, socrata_id, contributing_factors, vehicle_types)) %>%
+  rowwise() %>%
+  mutate(year = as.character(year(date_time)),
+         month = month(date_time),
+         cyclist_ksi = number_of_cyclist_injured + number_of_cyclist_killed,
+         cyclist_k = number_of_cyclist_killed,
+         cyclist_si = number_of_cyclist_injured)
+
+# How many are missing borough information?
+crashes_cleaned %>% 
+  filter(cyclist_ksi == 1) %>%
+  nrow()
+
+crashes_cleaned %>% 
+  filter(cyclist_ksi == 1) %>%
+  count(borough)
+# 4.1% of all KSI's are missing borough
+
+# How many are missing latitude/longitude information?
+crashes_cleaned %>%
+  filter(cyclist_ksi == 1 & is.na(latitude)|is.na(longitude)) %>%
+  select(on_street_name, cross_street_name)
+
+crashes_cleaned %>% count(borough)
+# 6.6% of all crashes are missing borough
+```
+
+Create summary table that we will use later in plots and tables. Note that 2011 is only partial year data, as records begin in August 2011. Include a note in graphs to flag this half year of data.
+
+```{r}
+
+crashes_sum <- crashes_cleaned %>%
+  group_by(year, borough) %>%
+  summarise(cyclist_ksi = sum(cyclist_ksi),
+            cyclist_k   = sum(cyclist_k),
+            cyclist_si  = sum(cyclist_si)) 
+
+# %>%
+#   filter(year != "2011" & !is.na(borough))
+
+```
+
+Create table of total crashes in the five boroughs (for the blog text) 
+
+```{r}
+
+crashes_sum %>%
+  group_by(year) %>%
+  summarise(`total cyclist KSIs citywide` = sum(cyclist_ksi)) %>%
+  gt() %>%
+  opt_row_striping(row_striping = TRUE) %>%
+  tab_source_note(source_note = "Only partial year data are available for 2011 and 2022")
+
+```
+
+
+
+Plot crahes two ways: as line graphs showing raw counts over time, and also as a stacked bar chart showing the distribution of KSI's across the 5 boroughs over time
+
+```{r}
+
+crash_line_g <- crashes_sum %>%
+  filter(!is.na(borough)) %>%
+  mutate(plotyear = ymd(paste0(year, "-01-01"))) %>%
+  ggplot() +
+  aes(x = plotyear, y = cyclist_ksi, color = borough) + 
+  geom_line() + 
+  geom_point() + 
+  scale_y_continuous(labels = scales::comma) + 
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y", minor_breaks = NULL) + 
+  labs(
+    title = "How many bikers were killed or severely injured every year?",
+    y = "count",
+    x = "year",
+    caption = "Note: Crash data for 2011 begin in August"
+  ) +
+  theme_minimal() 
+
+crash_line_g <- crashes_sum %>%
+  filter(!is.na(borough) & !year %in% c("2011", "2022")) %>%
+  mutate(plotyear = ymd(paste0(year, "-01-01"))) %>%
+  ggplot() +
+  aes(x = plotyear, y = cyclist_ksi, color = borough) + 
+  geom_line() + 
+  geom_point() + 
+  scale_y_continuous(labels = scales::comma) + 
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y", minor_breaks = NULL) + 
+  labs(
+    title = "How many bikers were killed or severely injured every year?",
+    y = "count",
+    x = "year") +
+  theme_minimal() 
+
+crash_line_g
+
+```
+
+```{r}
+
+# Stacked bar chart proportional
+
+crashes_sum %>%
+  mutate(plotyear = ymd(paste0(year, "-01-01"))) %>%
+  ggplot() + 
+  aes(x = plotyear, y = cyclist_ksi, color = borough, fill = borough) + 
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = scales::percent) + 
+  theme_minimal()
+
+
+```
+
+
+
+# 2. Read in ACS bike ridership data
+
+For this analysis, I am replicating the **[DOT method](https://www1.nyc.gov/html/dot/html/bicyclists/cyclinginthecity.shtml)**
+for estimating the total daily cycling trips, but at the county/borough level instead of citywide. 
+Their **[methods document](https://www1.nyc.gov/html/dot/downloads/pdf/cycling-in-the-city-appendix.pdf)**
+describes the method as the following:
+
+-   Average the last three 1-year ACS estimates of counts of biking in the Journey to Work data
+
+-   Double this count (assuming each person who bikes to work makes 2 trips to do so)
+
+-   Assuming this is 20% of the total bike trips used, multiply by 5 to get the average daily estimate
+
+**Additional decisions** that I made to expand upon the DOT analysis:
+
+-   Because 1-year data are not available for 2020, I will estimate values for 2020 and 2021 using two-year averages. 
+
+In my analysis, the total time period studied is 2011-2021 and the level of analysis is borough. I will pull ACS data from 2009-2021 and summarize it accordingly.
+
+```{r read in acs data}
+
+# # Install census key (commented out because only needs to happen once)
+# census_api_key("b79cffc22be2625e69c44505ffb55c60498f5796", install = TRUE)
+# Sys.getenv("CENSUS_API_KEY")
+
+# var20 <- load_variables(2020, "acs5", cache = TRUE)
+
+# Create function to read in a list of ACS data for every year of the analysis period (2013-2020)
+readacs <- function(yearval){
+  get_acs(
+    geography = "county",
+    variables = c(
+      totalpop  = "B08006_001",
+      totalbike = "B08006_014",
+      totalpubtrans = "B08006_008",
+      totalwalk = "B08006_015"
+    ),
+    state = "New York",
+    geometry = FALSE,
+    year = yearval,
+    survey = "acs1"
+  ) %>%
+    clean_names() %>%
+    filter(str_detect(name, "Bronx|New York County|Kings|Queens|Richmond")) %>%
+    mutate(moe_pct = moe / estimate)
+}
+
+# Create list of years of data to pull from ACS
+# (remove 2020 from the list because ACS 1-year estimates weren't published at the county level that year)
+yearval <- seq(from = 2009, to = 2021, by = 1)[-12]
+
+# Read in all the years of data as a list
+acslist <- lapply(yearval, readacs)
+
+# Assign names to each year based on same yearval
+names(acslist) <- yearval
+
+# Check that all vars are the same within years
+compare_df_cols_same(acslist)
+
+# Now bind the list into a single data frame, adding the names as a year var
+acs_raw <- rbindlist(acslist, idcol = "year") 
+
+glimpse(acs_raw)
+
+```
+
+Now, process the ACS bike to work data to estimate daily and annual ridership.
+
+```{r process acs ridership data}
+
+# Reshape to pull variables into their own columns
+acs <- acs_raw %>%
+  pivot_wider(id_cols = c(year, geoid, name),
+              names_from = variable,
+              values_from = estimate) %>%
+  arrange(name, year) %>%
+  mutate(
+    # 3 year average (2-year for 2021)
+    totalbike_3y = case_when(
+      year != "2021" ~ (totalbike + lag(totalbike, n=1) + lag(totalbike, n=2))/3,
+      TRUE ~ (totalbike + lag(totalbike, n=1))/2
+    ),
+    # create total daily bike estimate (DOT method)
+    daily_bike_est = totalbike_3y*2*5,
+    # create annual bike estimate (DOT method)
+    ann_bike_est = daily_bike_est * 365
+  )
+
+# Check layout, does it look right?
+head(acs, n=20)
+
+# Simplify to key outcomes, update boro
+acs_clean <- acs %>%
+  filter(!year %in% c("2009", "2010")) %>%
+  mutate(county = str_trim(sub(" County, New York", "", x = name)), side = "both",
+         borough = case_when(
+           county == "Kings" ~ "Brooklyn",
+           county == "New York" ~ "Manhattan",
+           county == "Richmond" ~ "Staten Island",
+           TRUE ~ county
+         )) %>%
+  select(year, borough, daily_bike_est, ann_bike_est)
+```
+
+As a sanity check, compare these estimates to those [published by DOT](https://www1.nyc.gov/html/dot/html/bicyclists/cyclinginthecity.shtml) at the citywide level
+
+```{r comparison to citywide numbers}
+# Check the city-wide numbers against DOT's numbers, do they look approximately the same?
+
+acs_clean %>%
+  group_by(year) %>%
+  summarise(citywide_daily_bike_est = sum(daily_bike_est))
+
+```
+
+Quick and dirty plot of ridership over the years for the text
+
+```{r}
+
+acs_clean %>%
+  mutate(plotdate = ymd(paste0(year, "-01-01"))) %>%
+  ggplot() + 
+  aes(x = plotdate, y = ann_bike_est, color = borough) + 
+  geom_line() + 
+  geom_point() + 
+  theme_minimal()
+
+```
+
+
+
+# 3. Join crash data with ACS ridership estimate
+
+Because KSI counts will likely increase as more people bike, it's important to normalize these values. We will join these datasets using year and borough. Note that we don't have ACS data from 2020 or 2022 and therefore won't be able to calculate ksi rates for those years.
+
+```{r}
+
+# glimpse(crashes_sum)
+# glimpse(acs_clean)
+
+# Create an in variable for each to check the success of the merge
+crashes_sum2 <- crashes_sum %>% mutate(incrash = 1)
+acs_clean2 <- acs_clean %>% mutate(inacs = 1)
+
+crash_rate <- full_join(crashes_sum2, acs_clean2, by=c("year", "borough")) %>%
+  filter(!is.na(borough) & !year %in% c("2020", "2022")) %>%
+  mutate(ksi_rate = cyclist_ksi/ann_bike_est,
+         k_rate   = cyclist_k/ann_bike_est,
+         si_rate  = cyclist_si/ann_bike_est)
+
+#Check merge
+crash_rate %>% count(incrash, inacs)  #should have 1 for both values all the time
+crash_rate %>% filter(is.na(inacs))   #should be 0 rows
+```
+
+## Plot: KSI rate by borough over years
+
+```{r}
+crash_rate_g <- crash_rate %>%
+  mutate(plotdate = ymd(paste0(year, "-01-01")),
+         ksi_rate_per100k = cyclist_ksi/ann_bike_est*100000)
+
+crash_rate_g
+
+crash_rate_plot <- crash_rate_g %>%
+  filter(borough != "Staten Island" & year != "2011") %>%
+  ggplot() +
+  aes(x = plotdate, y = ksi_rate_per100k, color = borough) + 
+  geom_line() + 
+  geom_point() + 
+  scale_y_continuous(limits = c(0,7), breaks = c(0,2,4,6), minor_breaks = NULL) + 
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y", minor_breaks = NULL) + 
+  labs(
+    title = "Annual bike crash rates",
+    y = "KSI rate per 100,000 bike trips",
+    x = "year",
+    caption = "Biking has become safer for most boroughs, but not the Bronx"
+  ) +
+  theme_minimal()
+
+# HK Notes: SI data are really messy and seem very erratic
+# Maybe this points to DOT's method of estimating bike rides being bad post-covid (biking to work less a measure of overall biking)
+# I would suggest removing it, maybe because citibike hasn't moved there yet
+
+# Save graph
+ggsave(crash_rate_plot, filename = "out/nyc_crash_rate.pdf", width = 9, height = 5, units = "in")
+
+```
+
+# 4. Read in Citi Bike data
+
+Citi Bike publishes monthly files with a record of every ride taken in their bike network. The data includes the coordinates of the station where the ride began and ended as well as the date and some other descriptive information. These data can be downloaded from their website and strung together to analyze trends in ridership within the Citi Bike network.
+
+For this project, I plan to download the files, read in an appropriate sample, and use ACS data to flag each trip by the borough it started in.
+
+```{r downloading CB data}
+
+# # HK: Commenting this out since it only needs to be run once to download all the files
+# dir1 <- "citibike_dl/"
+# 
+# url <- "https://s3.amazonaws.com/tripdata/"
+# 
+# # Create lists of all the citibike file names iterating over year and month vals
+# # File names follow different conventions starting in 2017, so group into two lists
+# pre17 <- 
+#   paste0(do.call(paste0, expand.grid(seq(2014, 2016, by=1),
+#                                      str_pad(seq(1, 12, by=1), width=2, pad="0"))))
+# 
+# post17 <- 
+#   paste0(do.call(paste0, expand.grid(seq(2017, 2021, by=1),
+#                                      str_pad(seq(1, 12, by=1), width=2, pad="0"))))
+# 
+# # Final list is named filnames
+# filnamesold <- 
+#   c(paste0("2013", str_pad(seq(6,12, by=1), width=2, pad="0")),
+#     pre17)
+# 
+# filnamesnew <- 
+#   c(post17,
+#     paste0("2022", str_pad(seq(1,9, by=1), width=2, pad="0")))
+# 
+# fil2013 <- paste0("2013", str_pad(seq(6,12, by=1), width=2, pad="0"))
+# fil2022 <- paste0("2022", str_pad(seq(1,9, by=1), width=2, pad="0"))
+# # remove records with typos in some of the files
+# fil2022 <- fil2022[c(1:5,8:9)]
+# 
+# # Create function to download all these files
+# 
+# read_citibikeold <- function(filnames){
+#   utils::download.file(url = glue(url, "{filnames}-citibike-tripdata.zip"),
+#                        destfile = file.path(dir1, glue("cb{filnames}.zip")),
+#                        method = "auto")
+#   unzip(file.path(dir1,glue("cb{filnames}.zip")),
+#         exdir = file.path(dir1, savname = glue("cb{filnames}")))
+# }
+# 
+# read_citibikenew <- function(filnames){
+#   utils::download.file(url = glue(url, "{filnames}-citibike-tripdata.csv.zip"),
+#                        destfile = file.path(dir1, glue("cb{filnames}.zip")),
+#                        method = "auto")
+#   unzip(file.path(dir1,glue("cb{filnames}.zip")),
+#         exdir = file.path(dir1, savname = glue("cb{filnames}")))
+# }
+# 
+# map(pre17, read_citibikeold)
+# map(fil2013, read_citibikeold)
+# map(post17, read_citibikenew)
+# map(fil2022, read_citibikenew)
+# 
+# # read in the 2022 06/07 records manually since there are typos in their names
+# utils::download.file(url = glue(url, "202206-citbike-tripdata.csv.zip"),
+#                      destfile = file.path(dir1, glue("cb202206.zip")),
+#                      method = "auto")
+# unzip(file.path(dir1,glue("cb202206.zip")),
+#       exdir = file.path(dir1, savname = glue("cb202206")))
+# 
+# utils::download.file(url = glue(url, "202207-citbike-tripdata.csv.zip"),
+#                      destfile = file.path(dir1, glue("cb202207.zip")),
+#                      method = "auto")
+# unzip(file.path(dir1,glue("cb202207.zip")),
+#       exdir = file.path(dir1, savname = glue("cb202207")))
+
+# HK Reading in all the files causes R to crash, stick to just August from every year
+# Read in all the csv files
+
+```
+
+## Methodological issues and decisions
+
+There are some limitations to working with Citi Bike data. First, the files are huge, with millions of records. First, I restricted the variables read in from each file to just the essential ones for this analysis. 
+
+However, this was still too much data, so I selected a sample of months of data to download instead. I opted for four quarters of data: February, May, August, and November. I assume that these four months of data will accurately represent ridership rates during different seasons. 
+
+Even with these limits, there were still more than 19 millions records of trips which was too much. Instead of reading in the entire set of monthly records, I read in a random sample of 1% of rows using the `dplyr::slice_sample()` function. This preserves the ratio of trips in each month of data and allowed the borough-assignment process to proceed in about 4 minutes instead of far longer.
+
+```{r read in CB data}
+
+#----- Create lists of file paths for the different months of data
+
+#set patternts to look for as a vector so I can paste them together without it looking messy
+patterns <- c("02-citibike-tripdata.csv", "05-citibike-tripdata.csv", 
+              "08-citibike-tripdata.csv", "11-citibike-tripdata.csv", 
+              "02 - Citi Bike trip data.csv", "05 - Citi Bike trip data.csv", 
+              "08 - Citi Bike trip data.csv", "11 - Citi Bike trip data.csv")
+
+fillist <- list.files(path = "citibike_dl/",
+                      pattern = paste(patterns, collapse = "|"),
+                      recursive=TRUE) %>%
+  paste0("citibike_dl/", .)
+
+# Separate into two lists based on variable formatting (var names changed in 2021)
+fillist1 <- fillist[1:30]
+fillist2 <- fillist[31:37]
+
+
+#----- Read in all the months of data using functional programming
+
+# Create a function to use to read in and clean the file names so they are more standardized across years
+# Note that we will slice a random sample of 1/100 of the file, because there are almost 20 million cases across the 10 years of data
+readfn1 <- function(fillist){
+  read_csv(fillist,
+           skip = 1,
+           col_names = c("tripduration", "starttime", "stoptime", "start_station_id", 
+                         "start_station_name", "start_station_latitude", "start_station_longitude",
+                         "end_station_id", "end_station_name", "end_station_latitude", "end_station_longitude",
+                         "bikeid", "usertype", "birth_year", "gender"),
+           col_select = c(start_station_latitude, start_station_longitude,
+                          end_station_latitude, end_station_longitude, starttime),
+           col_types = list(starttime = col_character())
+           ) %>%
+    slice_sample(prop = 0.01) %>%
+    clean_names()
+}
+
+readfn2 <- function(fillist){
+  read_csv(fillist,
+           col_select = c(start_lat, start_lng, end_lat, end_lng, started_at)) %>%
+    slice_sample(prop = 0.01) 
+}
+
+# Read in every dataset into a list
+cblist1 <- lapply(fillist1, readfn1)
+cblist2 <- lapply(fillist2, readfn2)
+
+# Look at col names and check that all cols are in the same format before stacking
+compare_df_cols_same(cblist1) %>%
+  as.data.frame()
+compare_df_cols_same(cblist2) %>%
+  as.data.frame()
+
+cb1 <- rbindlist(cblist1, use.names=TRUE, fill=TRUE) %>%
+  rename(start_lat = start_station_latitude,
+         start_lng = start_station_longitude,
+         end_lat = end_station_latitude,
+         end_lng = end_station_longitude) %>%
+  mutate(started_at = parse_date_time(starttime, c("%Y-%m-%d %H:%M:%S", "%m/%d/Y %H:%M:%S", "%m/%d/Y %H:%M")),
+         year = year(started_at),
+         month = month(started_at))
+
+cb2 <- rbindlist(cblist2, use.names=TRUE, fill=TRUE) %>%
+  mutate(year = year(started_at),
+         month = month(started_at))
+
+compare_df_cols(cb1, cb2)
+
+allcb <- bind_rows(cb1, cb2) %>%
+  select(start_lat, start_lng, end_lat, end_lng, year, month) %>%
+  mutate(id = row_number())
+
+glimpse(allcb)
+
+
+```
+
+The next step is to identify the borough that each trip started in so we can plot trends by borough (the unit of analysis for crashes). Create a spatial file based and use ACS shapefiles of counties to assign the borough variable.
+
+```{r}
+
+# Convert citi bike data to a spatial file
+cbstartsf <- allcb %>%
+  select(start_lat, start_lng, id, year, month) %>%
+  st_as_sf(coords = c("start_lng", "start_lat"), crs = st_crs(4326)) %>%
+  st_transform(crs = st_crs(4269))      # same CRS as the ACS data
+
+```
+
+```{r}
+
+# Get shapefiles for each county from ACS
+# Staten Island is excluded because we know that Citi Bike doesn't have any stations in that borough
+countymap <- 
+  get_acs(geography = "county",
+          variables = c(totalpop  = "B08006_001"),
+          state = "New York",
+          geometry = TRUE,
+          year = 2020,
+          survey = "acs5"
+  ) %>%
+  clean_names() %>%
+  filter(str_detect(name, "Bronx|New York County|Kings|Queens")) %>%
+  mutate(county = str_trim(sub(" County, New York", "", x = name)),
+         borough = case_when(
+           county == "Kings" ~ "Brooklyn",
+           county == "New York" ~ "Manhattan",
+           TRUE ~ county
+         )) %>%
+  select(borough, geometry)
+
+# look at map data, does it look right?
+countymap
+
+```
+
+```{r}
+
+# Create borough variable using st_intersects to compare coordinates to borough geometry
+
+cbstartsf$borough <- apply(st_intersects(countymap, cbstartsf, sparse = TRUE), 2, 
+                                function(col) { 
+                                  countymap[which(col), ]$borough
+                                  })
+
+# This takes about 6.5 minutes to run
+```
+
+Now create a summary table using borough information.
+
+```{r}
+
+cbfreqstarts_m <- cbstartsf %>%
+  st_drop_geometry() %>%
+  filter(borough %in% c("Manhattan", "Brooklyn", "Queens", "Bronx")) %>%
+  count(year, month, borough, name = "hundreds_of_trips") %>%
+  mutate(monthly_trips = hundreds_of_trips * 100,
+         date = ymd(paste0(year, str_pad(month, width = 2, side = "left", pad = "0"), "01")),
+         borough = unlist(borough))
+
+cbfreqstarts_m
+
+cbfreqstarts_y <- cbfreqstarts_m %>%
+  group_by(year, borough) %>% 
+  summarise(annual_trips = sum(monthly_trips)*3) %>%
+  mutate(date = ymd(paste0(year, "-01-01")))
+
+cbfreqstarts_y
+
+```
+
+## Plot: Citi Bike ridership by month
+
+```{r}
+
+cbfreqstarts_m %>%
+  ggplot() + 
+  aes(x = date, y = monthly_trips, color = borough) + 
+  geom_line() + 
+  geom_point() + 
+  scale_x_date(limits = c(ymd("2013-01-01", ymd("2023-01-01"))),
+               date_breaks = "1 year", 
+               date_labels = "%Y", 
+               minor_breaks = NULL) + 
+  scale_y_continuous(limits = c(0,2700000), 
+                     labels = scales::comma, 
+                     breaks = c(0, 500000, 1000000, 1500000, 2000000, 2500000), 
+                     minor_breaks = NULL) + 
+  labs(
+    title = "Citi Bike ridership has increased dramatically",
+    y = "monthly trips",
+    x = "year"
+  ) +
+  theme_minimal()
+
+```
+
+## Plot: Citi Bike ridership by year
+
+For this plot, remove partial years 2013 and 2022
+
+```{r}
+
+cbfreqstarts_y %>%
+  pivot_wider(id_cols = date, names_from = borough, values_from = annual_trips)
+
+citibike_plot <- cbfreqstarts_y %>%
+  filter(!date %in% c(ymd("2013-01-01"), ymd("2022-01-01"))) %>%
+  ggplot() + 
+  aes(x = date, y = annual_trips, color = borough) + 
+  geom_line() + 
+  geom_point() + 
+  scale_x_date(limits = c(ymd("2014-01-01", ymd("2021-01-01"))),
+               date_breaks = "1 year", 
+               date_labels = "%Y", 
+               minor_breaks = NULL) + 
+  scale_y_continuous(limits = c(0,20000000), 
+                     labels = scales::comma, 
+                     #breaks = c(0, 500000, 1000000, 1500000, 2000000), 
+                     minor_breaks = NULL) + 
+  labs(
+    title = "Estimated annual Citi Bike ridership",
+    y = "estimated annual trips",
+    x = "year",
+    caption = "Citi Bike ridership has increased dramatically, especially in Manhattan \nPartial years of data in 2013 and 2022 have been excluded"
+  ) +
+  theme_minimal()
+
+
+# Save graph
+ggsave(citibike_plot, filename = "out/nyc_citibike.pdf", width = 9, height = 5, units = "in")
+
+
+```
+
